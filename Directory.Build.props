@@ -1,0 +1,23 @@
+<Project>
+  <!--
+    ============================================================
+    REQUIREMENT: .NET 10 SDK must be installed.
+    ReBuzz is built on .NET 10, so the SDK version must match.
+    Download: https://dotnet.microsoft.com/download/dotnet/10.0
+
+    Set ReBuzzDir to wherever ReBuzz.exe lives on your machine.
+    Both BuzzGUI.Interfaces.dll and BuzzGUI.Common.dll must be
+    present in that folder (they ship with every ReBuzz release).
+
+    Common locations:
+      C:\Program Files\ReBuzz
+      C:\Users\<you>\AppData\Local\Programs\ReBuzz
+
+    You can also pass it on the command line:
+      dotnet build -p:ReBuzzDir="D:\Tools\ReBuzz"
+    ============================================================
+  -->
+  <PropertyGroup>
+    <ReBuzzDir Condition="'$(ReBuzzDir)'==''">C:\Program Files\ReBuzz</ReBuzzDir>
+  </PropertyGroup>
+</Project>

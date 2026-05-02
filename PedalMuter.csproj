@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Pedal Muter.NET</AssemblyName>
+    <RootNamespace>WDE.PedalMuter</RootNamespace>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Optimize>true</Optimize>
+
+    <!-- Control machine — deploys to Generators alongside PeerCtrl.       -->
+    <!-- $(ReBuzzDir) is defined in Directory.Build.props                  -->
+    <OutputPath>$(ReBuzzDir)\Gear\Generators\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+
+    <AssemblyTitle>Pedal Muter</AssemblyTitle>
+    <Company>WDE</Company>
+    <Product>Pedal Muter</Product>
+    <Copyright>© 2026 WDE</Copyright>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <!--
+    ReBuzz managed-machine API DLLs.
+    HintPath resolves via $(ReBuzzDir) from Directory.Build.props.
+
+    To build inside the ReBuzz solution tree, swap these for:
+      <ProjectReference Include="..\BuzzGUI.Interfaces\BuzzGUI.Interfaces.csproj"/>
+      <ProjectReference Include="..\BuzzGUI.Common\BuzzGUI.Common.csproj"/>
+  -->
+  <ItemGroup>
+    <Reference Include="ReBuzz">
+      <HintPath>$(ReBuzzDir)\ReBuzz.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>$(ReBuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BuzzGUI.Common">
+      <HintPath>$(ReBuzzDir)\BuzzGUI.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
