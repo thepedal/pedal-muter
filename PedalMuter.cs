@@ -9,9 +9,12 @@
 // Output: $(ReBuzzDir)\Gear\Generators\
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Input;
 using Buzz.MachineInterface;
@@ -116,55 +119,67 @@ namespace WDE.PedalMuter
             DefValue    = 0)]
         public void SetMute(int value, int track)
         {
-            if ((uint)track >= MAX_TRACKS) return;
+            if ((uint)track >= MAX_TRACKS)
+            {
+                DLog($"SetMute REJECT track={track} out of range");
+                return;
+            }
             if (_initialising)
             {
+                DLog($"SetMute first-call: clearing _initialising and resolving");
                 _initialising = false;
                 ResolveAllTargets();
             }
 
             bool newState = (value == 1);
             var ts = _tracks[track];
-            if (ts.MuteState == newState) return;
+            if (ts.MuteState == newState)
+            {
+                DLog($"SetMute SKIP track={track} value={value} (already {newState}) — " +
+                     $"assignments=[{DescribeAssignments(ts)}]");
+                // Still poll siblings — the user may have written multiple
+                // tracks in the same tick and parametersChanged dropped them.
+                PollSiblingMutePValues(track);
+                return;
+            }
 
+            DLog($"SetMute track={track} value={value} {ts.MuteState}→{newState} " +
+                 $"assignments=[{DescribeAssignments(ts)}]");
+            ApplyMuteTransition(track, newState);
+
+            // ──────────────────────────────────────────────────────────────
+            // §14 multi-track recovery (Core notes §14).
+            //
+            // parametersChanged is Dictionary<IParameter, int> — keyed by
+            // parameter, value = last writer's track.  When 6 tracks all
+            // write to Mute in the same tick, the dictionary holds only
+            // the last track; the setter fires ONCE for that track and the
+            // other 5 writes are silently lost.
+            //
+            // Recover them by reading pvalues for every track directly.
+            // pvalues is still populated at this point (the post-Tick reset
+            // hasn't run yet — that's in step 5's tail).  Any track with
+            // pvalue != NoValue whose current MuteState differs from the
+            // pvalue is a recovery candidate.
+            // ──────────────────────────────────────────────────────────────
+            PollSiblingMutePValues(track);
+        }
+
+        // Apply a single track's mute transition: state update, mute-time
+        // or unmute-time flush, dispatch IsMuted.  Factored out so the §14
+        // recovery path can reuse it.
+        void ApplyMuteTransition(int track, bool newState)
+        {
+            var ts = _tracks[track];
+            if (ts.MuteState == newState) return;
             bool isMuting   = !ts.MuteState && newState;
             bool isUnmuting =  ts.MuteState && !newState;
             ts.MuteState = newState;
 
             if (isMuting)
-            {
-                // ──────────────────────────────────────────────────────────
-                // Mute-time flush: send Note-Off WHILE the target is still
-                // active, so its AudioTick this same buffer delivers the
-                // release to the plugin.  Reduces (but doesn't eliminate)
-                // the "stale voice on resume" problem — plugins with a long
-                // release envelope will still have an unfinished release
-                // frozen in their state when bypass kicks in.
-                // ──────────────────────────────────────────────────────────
                 FlushTargetsNoteOff(ts);
-            }
             else if (isUnmuting)
-            {
-                // ──────────────────────────────────────────────────────────
-                // Unmute-time flush: arm a counter that sends Note-Off on
-                // every Work() pass for the next few buffers.  This handles
-                // the cases the mute-time flush misses:
-                //   - long-release voices that were frozen mid-release in
-                //     the plugin's internal state during bypass
-                //   - plugins where the standard pt_note Note-Off didn't
-                //     reach the voice during the mute transition
-                //
-                // Spread across multiple buffers because the IsMuted=false
-                // dispatch is async (BeginInvoke on the UI dispatcher);
-                // the first few buffers after this setter call may still
-                // be running with WorkMachine bypassed, so any single Work
-                // pass might or might not actually be rendering.  By the
-                // last of STALE_FLUSH_BUFFERS, the dispatch has definitely
-                // landed and the plugin is rendering — that Note-Off is
-                // guaranteed to take effect.
-                // ──────────────────────────────────────────────────────────
                 ts.PostUnmuteFlushBuffers = STALE_FLUSH_BUFFERS;
-            }
 
             ApplyTrack(ts);
         }
@@ -273,10 +288,21 @@ namespace WDE.PedalMuter
 
         public void ResolveAllTargets()
         {
-            if (Buzz == null) return;
+            if (Buzz == null)
+            {
+                DLog("ResolveAllTargets: Buzz==null, abort");
+                return;
+            }
+            int resolved = 0, missing = 0, total = 0;
             foreach (var ts in _tracks)
                 foreach (var a in ts.Assignments)
+                {
                     ResolveAssignment(a);
+                    total++;
+                    if (a.ResolvedMachine != null) resolved++;
+                    else if (!string.IsNullOrEmpty(a.MachineName)) missing++;
+                }
+            DLog($"ResolveAllTargets: {resolved}/{total} resolved, {missing} missing");
             // Re-apply current mute state to any newly resolved targets.
             foreach (var ts in _tracks)
                 ApplyTrack(ts);
@@ -292,7 +318,12 @@ namespace WDE.PedalMuter
             for (int i = 0; i < ts.Assignments.Count; i++)
             {
                 var a = ts.Assignments[i];
-                if (a.ResolvedMachine == null) continue;
+                if (a.ResolvedMachine == null)
+                {
+                    if (!string.IsNullOrEmpty(a.MachineName))
+                        DLog($"ApplyTrack: SKIP assignment[{i}] name=\"{a.MachineName}\" — RESOLVED IS NULL");
+                    continue;
+                }
                 // Refuse to mute ourselves — that would freeze the controller.
                 if (ReferenceEquals(a.ResolvedMachine, hostMachine)) continue;
                 SetMachineMutedUiSafe(a.ResolvedMachine, ts.MuteState);
@@ -308,20 +339,200 @@ namespace WDE.PedalMuter
         static void SetMachineMutedUiSafe(IMachine m, bool muted)
         {
             if (m == null) return;
-            try { if (m.IsMuted == muted) return; } catch { return; }
+            bool currentlyMuted;
+            try { currentlyMuted = m.IsMuted; } catch (Exception ex) { DLog($"SetMachineMutedUiSafe READ-EX on {SafeName(m)}: {ex.Message}"); return; }
+            if (currentlyMuted == muted) return;
 
             var d = System.Windows.Application.Current?.Dispatcher;
-            if (d == null || d.CheckAccess())
+            if (d == null)
             {
-                try { m.IsMuted = muted; } catch { }
+                DLog($"SetMachineMutedUiSafe({SafeName(m)},{muted}): Application.Current.Dispatcher==null — write SKIPPED");
+                return;
+            }
+            if (d.CheckAccess())
+            {
+                try { m.IsMuted = muted; DLog($"SetMachineMutedUiSafe({SafeName(m)},{muted}): applied inline"); }
+                catch (Exception ex) { DLog($"SetMachineMutedUiSafe({SafeName(m)},{muted}): WRITE-EX inline: {ex.Message}"); }
             }
             else
             {
-                d.BeginInvoke(new Action(() =>
+                var op = d.BeginInvoke(new Action(() =>
                 {
-                    try { if (m != null) m.IsMuted = muted; } catch { }
+                    try
+                    {
+                        if (m != null)
+                        {
+                            m.IsMuted = muted;
+                            DLog($"SetMachineMutedUiSafe({SafeName(m)},{muted}): applied via dispatch");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        DLog($"SetMachineMutedUiSafe({SafeName(m)},{muted}): WRITE-EX dispatched: {ex.Message}");
+                    }
                 }));
+                if (op == null)
+                    DLog($"SetMachineMutedUiSafe({SafeName(m)},{muted}): BeginInvoke returned null");
             }
+        }
+
+        // =====================================================================
+        // §14 multi-track recovery (Core notes §14)
+        //
+        // ParameterCore.parametersChanged is Dictionary<IParameter, int>:
+        // keyed by parameter, value = last writer's track index. When
+        // multiple tracks write to the same parameter in the same tick
+        // (PeerCtrl fanning out, Unmute All firing 6 SetValues in a row,
+        // pattern automation with multiple Mute events on the same row),
+        // every write but the last is silently dropped.  Our setter then
+        // fires for ONE track and the others stay in their old state.
+        //
+        // Recovery: from inside the (one) setter call we DO get, read
+        // pvalues for every other track directly via reflection and apply
+        // any that differ from our internal state.  pvalues is still
+        // populated at this point — the post-Tick reset (MachineWorkInstance
+        // step ~5 tail) hasn't run yet.
+        // =====================================================================
+
+        IParameter _ownMuteParam;
+        ConcurrentDictionary<int, int> _ownMutePValues;
+        bool _pollSetupAttempted;
+
+        bool EnsurePollSetup()
+        {
+            if (_ownMutePValues != null) return true;
+            if (_pollSetupAttempted) return false;
+            _pollSetupAttempted = true;
+
+            try
+            {
+                var pg = host?.Machine?.ParameterGroups;
+                if (pg == null || pg.Count <= 2)
+                {
+                    DLog("EnsurePollSetup: ParameterGroups not ready");
+                    return false;
+                }
+                _ownMuteParam = pg[2]?.Parameters?
+                    .FirstOrDefault(p => p?.Name == "Mute");
+                if (_ownMuteParam == null)
+                {
+                    DLog("EnsurePollSetup: no Mute parameter found on track group");
+                    return false;
+                }
+
+                // Walk the type hierarchy looking for the pvalues field on
+                // ParameterCore. Field name is "pvalues" (lowercase) in
+                // 1818-preview/1819-preview. Type is
+                // ConcurrentDictionary<int,int>.
+                var t = _ownMuteParam.GetType();
+                while (t != null && _ownMutePValues == null)
+                {
+                    var f = t.GetField("pvalues",
+                        BindingFlags.Instance |
+                        BindingFlags.NonPublic |
+                        BindingFlags.Public);
+                    if (f != null)
+                    {
+                        _ownMutePValues = f.GetValue(_ownMuteParam)
+                            as ConcurrentDictionary<int, int>;
+                    }
+                    t = t.BaseType;
+                }
+
+                if (_ownMutePValues == null)
+                {
+                    DLog("EnsurePollSetup: pvalues field not found or wrong type — " +
+                         "§14 recovery DISABLED");
+                    return false;
+                }
+
+                DLog("EnsurePollSetup: §14 polling READY");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                DLog($"EnsurePollSetup: exception {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
+        }
+
+        void PollSiblingMutePValues(int firedTrack)
+        {
+            if (!EnsurePollSetup()) return;
+
+            int noValue = 255;
+            try { noValue = _ownMuteParam.NoValue; } catch { }
+
+            int recovered = 0;
+            foreach (var kv in _ownMutePValues)
+            {
+                int track  = kv.Key;
+                int pvalue = kv.Value;
+
+                if (track == firedTrack) continue;
+                if ((uint)track >= MAX_TRACKS) continue;
+                if (pvalue == noValue) continue;          // no event this row
+                if (pvalue != 0 && pvalue != 1) continue; // out of range
+
+                bool desired = (pvalue == 1);
+                var ts = _tracks[track];
+                if (ts.MuteState == desired) continue;     // already in sync
+
+                DLog($"§14 RECOVERY track={track} pvalue={pvalue} " +
+                     $"{ts.MuteState}→{desired} " +
+                     $"assignments=[{DescribeAssignments(ts)}]");
+                ApplyMuteTransition(track, desired);
+                recovered++;
+            }
+
+            if (recovered > 0)
+                DLog($"§14 RECOVERY: applied {recovered} missed transitions");
+        }
+
+        // =====================================================================
+        // Diagnostics
+        //
+        // Logging goes through Trace.WriteLine (NOT Debug.WriteLine — the
+        // latter is stripped from Release builds).  Capture with DebugView
+        // from Sysinternals, filter on "[PedalMuter]" prefix.
+        // =====================================================================
+
+        static readonly long _epoch = Environment.TickCount64;
+
+        internal static void DLog(string msg)
+        {
+            try
+            {
+                Trace.WriteLine($"[PedalMuter] T+{Environment.TickCount64 - _epoch}ms {msg}");
+            }
+            catch { }
+        }
+
+        static string SafeName(IMachine m)
+        {
+            try { return m?.Name ?? "(null)"; }
+            catch { return "(name-throw)"; }
+        }
+
+        string DescribeAssignments(TrackState ts)
+        {
+            if (ts.Assignments.Count == 0) return "(none)";
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < ts.Assignments.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                var a = ts.Assignments[i];
+                string name = string.IsNullOrEmpty(a.MachineName) ? "(unset)" : a.MachineName;
+                if (a.ResolvedMachine == null)
+                    sb.Append(name).Append("=NULL");
+                else
+                {
+                    bool live = false;
+                    try { live = a.ResolvedMachine.IsMuted; } catch { }
+                    sb.Append(name).Append("=").Append(live ? "M" : "P");
+                }
+            }
+            return sb.ToString();
         }
 
         // =====================================================================
@@ -462,19 +673,38 @@ namespace WDE.PedalMuter
 
         public IEnumerable<IMenuItem> Commands => new IMenuItem[]
         {
-            new MenuEntry(0, "Assignments...",      OpenSettings),
-            new MenuEntry(1, "Unmute All Targets",  UnmuteAllTargetsImmediate),
-            new MenuEntry(2, "About...",            ShowAbout),
+            new MenuEntry(0, "Assignments...",          OpenSettings),
+            new MenuEntry(1, "Force Re-Resolve Targets", ForceReResolve),
+            new MenuEntry(2, "Unmute All Targets",      UnmuteAllTargetsImmediate),
+            new MenuEntry(3, "About...",                ShowAbout),
         };
 
         public void Command(int id)
         {
             switch (id)
             {
-                case 0: OpenSettings();             break;
-                case 1: UnmuteAllTargetsImmediate(); break;
-                case 2: ShowAbout();                break;
+                case 0: OpenSettings();              break;
+                case 1: ForceReResolve();            break;
+                case 2: UnmuteAllTargetsImmediate(); break;
+                case 3: ShowAbout();                 break;
             }
+        }
+
+        // Manual re-resolution.  Useful for two situations:
+        //   1. As a workaround if a target was deleted-and-readded under the
+        //      same name — our cached IMachine pointer is to the orphan
+        //      instance, so writes to IsMuted don't reach the live machine.
+        //      Re-resolve picks up the new instance.
+        //   2. As a diagnostic step: if Force Re-Resolve fixes the problem,
+        //      you know the bug was a stale reference.
+        void ForceReResolve()
+        {
+            DLog("ForceReResolve invoked from menu");
+            var d = System.Windows.Application.Current?.Dispatcher;
+            if (d == null || d.CheckAccess())
+                ResolveAllTargets();
+            else
+                d.BeginInvoke(new Action(ResolveAllTargets));
         }
 
         SettingsWindow _settingsWindow;

@@ -11,6 +11,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using BuzzGUI.Interfaces;
 
 namespace WDE.PedalMuter
@@ -74,7 +75,22 @@ namespace WDE.PedalMuter
             _trackCombo.SelectedIndex = 0;
             _selTrack = 0;
             RefreshAssignmentList();
+
+            // Live divergence poll: every 500 ms, compare each assignment's
+            // MuteState to the target's actual IsMuted and flag mismatches
+            // in the status line.  Real-time visibility into the exact bug
+            // the user is hunting — "Pedal Muter says unmuted, target says
+            // muted (or vice versa)".
+            _statusTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromMilliseconds(500),
+            };
+            _statusTimer.Tick += (_, _) => UpdateStatus();
+            _statusTimer.Start();
+            Closed += (_, _) => { try { _statusTimer.Stop(); } catch { } };
         }
+
+        DispatcherTimer _statusTimer;
 
         // =====================================================================
         // Layout
@@ -117,7 +133,7 @@ namespace WDE.PedalMuter
             Grid.SetRow(top, 0);
             root.Children.Add(top);
 
-            // Status + Close
+            // Status + Close + Re-resolve
             var bottom = new DockPanel { Margin = new Thickness(0, 8, 0, 0) };
             _statusText = new TextBlock
             {
@@ -128,10 +144,29 @@ namespace WDE.PedalMuter
             DockPanel.SetDock(_statusText, Dock.Left);
             bottom.Children.Add(_statusText);
 
+            var btnRow = new StackPanel
+            {
+                Orientation         = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+            };
+            DockPanel.SetDock(btnRow, Dock.Right);
+
+            var reResolveBtn = MkButton("Force Re-Resolve", (_, _) =>
+            {
+                // Fixes the stale-IMachine-pointer scenario where a target
+                // was deleted-and-readded under the same name — our cached
+                // pointer is to the orphan and writes don't reach the
+                // current live machine.  Also a fast diagnostic: if this
+                // fixes the bug, the bug was a stale reference.
+                _machine.ResolveAllTargets();
+                RefreshAssignmentList();
+            });
+            btnRow.Children.Add(reResolveBtn);
+
             var closeBtn = MkButton("Close", (_, _) => Close());
-            closeBtn.HorizontalAlignment = HorizontalAlignment.Right;
-            DockPanel.SetDock(closeBtn, Dock.Right);
-            bottom.Children.Add(closeBtn);
+            btnRow.Children.Add(closeBtn);
+
+            bottom.Children.Add(btnRow);
 
             Grid.SetRow(bottom, 1);
             root.Children.Add(bottom);
@@ -395,11 +430,36 @@ namespace WDE.PedalMuter
         void UpdateStatus()
         {
             var ts       = _machine.GetTrack(_selTrack);
+            if (ts == null) return;
             int total    = ts.Assignments.Count;
             int resolved = ts.Assignments.Count(a => a.ResolvedMachine != null);
             string state = ts.MuteState ? "MUTED" : "playing";
+
+            // Divergence check: any target whose actual IsMuted differs
+            // from what we think it should be.  These are the smoking
+            // guns for the "mute parameter triggered but not passed on"
+            // bug — count them and list the first offender by name.
+            int diverged   = 0;
+            string firstBad = null;
+            foreach (var a in ts.Assignments)
+            {
+                if (a.ResolvedMachine == null) continue;
+                bool live;
+                try { live = a.ResolvedMachine.IsMuted; }
+                catch { continue; }
+                if (live != ts.MuteState)
+                {
+                    diverged++;
+                    if (firstBad == null) firstBad = a.MachineName;
+                }
+            }
+
+            string divText = diverged == 0
+                ? ""
+                : $"  ⚠ {diverged} DIVERGED (first: {firstBad}={(ts.MuteState ? "should-be-muted" : "should-be-playing")})";
+            _statusText.Foreground = diverged == 0 ? FgMuted : FgWarn;
             _statusText.Text =
-                $"Track {_selTrack + 1}: {resolved}/{total} resolved · currently {state}.";
+                $"Track {_selTrack + 1}: {resolved}/{total} resolved · we say {state}.{divText}";
         }
 
         // =====================================================================
