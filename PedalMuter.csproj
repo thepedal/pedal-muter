@@ -2,6 +2,9 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
     <UseWPF>true</UseWPF>
     <AssemblyName>Pedal Muter.NET</AssemblyName>
     <RootNamespace>WDE.PedalMuter</RootNamespace>
