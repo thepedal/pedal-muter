@@ -394,64 +394,92 @@ namespace WDE.PedalMuter
         // step ~5 tail) hasn't run yet.
         // =====================================================================
 
-        IParameter _ownMuteParam;
-        ConcurrentDictionary<int, int> _ownMutePValues;
-        bool _pollSetupAttempted;
+        IParameter    _ownMuteParam;
+        Func<int,int> _ownMuteReader;   // track -> raw pvalue (or NoValue)
+        int           _probeAttempts;   // diagnostic: tries before success
 
+        // Shape-tolerant reader for ParameterCore.pvalues (Core §42 / Tracker §16.3).
+        //
+        // The backing container changed type across ReBuzz builds; the field
+        // name, visibility, and meaning did not:
+        //   ReBuzz ≤1826 : ConcurrentDictionary<int,int>  (sparse, fired tracks only)
+        //   ReBuzz 1827+ : int[]  (fixed int[256], Array.Fill-cleared, never reassigned)
+        //
+        // The old code cast straight to ConcurrentDictionary<int,int>; on 1827+
+        // that `as` cast returns null with no exception, silently disabling the
+        // §14 recovery and reviving the "only the last track mutes" engine bug.
+        // Detect the shape once and close over whichever container is present.
+        static Func<int,int> GetPValuesReader(IParameter p)
+        {
+            int noVal = 255;
+            try { noVal = p.NoValue; } catch { }
+
+            FieldInfo fi = null;
+            var t = p.GetType();
+            while (t != null && fi == null)
+            {
+                fi = t.GetField("pvalues",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                t = t.BaseType;
+            }
+            if (fi == null) return null;
+
+            object raw = fi.GetValue(p);
+            if (raw == null) return null;
+
+            if (raw is ConcurrentDictionary<int, int> dict)        // ≤1826
+                return tr => dict.TryGetValue(tr, out int v) ? v : noVal;
+            if (raw is int[] arr)                                  // 1827+
+                return tr => (uint)tr < (uint)arr.Length ? arr[tr] : noVal;
+
+            // Unknown future shape: degrade to "no recovery" rather than throw
+            // on the audio thread (Core §40 fail-closed posture).
+            DLog($"GetPValuesReader: unrecognised pvalues type {raw.GetType().Name} — " +
+                 "§14 recovery unavailable");
+            return _ => noVal;
+        }
+
+        // Retry until success — do NOT latch a "tried once" flag (Presetter §2.4.1).
+        // The first SetMute can arrive before ParameterGroups is fully populated;
+        // a permanent-disable flag there would kill recovery for the whole session.
         bool EnsurePollSetup()
         {
-            if (_ownMutePValues != null) return true;
-            if (_pollSetupAttempted) return false;
-            _pollSetupAttempted = true;
+            if (_ownMuteReader != null) return true;
+            _probeAttempts++;
 
             try
             {
                 var pg = host?.Machine?.ParameterGroups;
                 if (pg == null || pg.Count <= 2)
                 {
-                    DLog("EnsurePollSetup: ParameterGroups not ready");
+                    DLog($"EnsurePollSetup: ParameterGroups not ready (attempt {_probeAttempts})");
                     return false;
                 }
-                _ownMuteParam = pg[2]?.Parameters?
+
+                var muteParam = pg[2]?.Parameters?
                     .FirstOrDefault(p => p?.Name == "Mute");
-                if (_ownMuteParam == null)
+                if (muteParam == null)
                 {
-                    DLog("EnsurePollSetup: no Mute parameter found on track group");
+                    DLog($"EnsurePollSetup: no Mute parameter on track group (attempt {_probeAttempts})");
                     return false;
                 }
 
-                // Walk the type hierarchy looking for the pvalues field on
-                // ParameterCore. Field name is "pvalues" (lowercase) in
-                // 1818-preview/1819-preview. Type is
-                // ConcurrentDictionary<int,int>.
-                var t = _ownMuteParam.GetType();
-                while (t != null && _ownMutePValues == null)
+                var reader = GetPValuesReader(muteParam);
+                if (reader == null)
                 {
-                    var f = t.GetField("pvalues",
-                        BindingFlags.Instance |
-                        BindingFlags.NonPublic |
-                        BindingFlags.Public);
-                    if (f != null)
-                    {
-                        _ownMutePValues = f.GetValue(_ownMuteParam)
-                            as ConcurrentDictionary<int, int>;
-                    }
-                    t = t.BaseType;
-                }
-
-                if (_ownMutePValues == null)
-                {
-                    DLog("EnsurePollSetup: pvalues field not found or wrong type — " +
-                         "§14 recovery DISABLED");
+                    DLog($"EnsurePollSetup: pvalues field not found (attempt {_probeAttempts})");
                     return false;
                 }
 
-                DLog("EnsurePollSetup: §14 polling READY");
+                // Commit to instance fields only after the whole probe succeeds.
+                _ownMuteParam  = muteParam;
+                _ownMuteReader = reader;
+                DLog($"EnsurePollSetup: §14 polling READY (after {_probeAttempts} attempt(s))");
                 return true;
             }
             catch (Exception ex)
             {
-                DLog($"EnsurePollSetup: exception {ex.GetType().Name}: {ex.Message}");
+                DLog($"EnsurePollSetup: exception {ex.GetType().Name}: {ex.Message} (attempt {_probeAttempts})");
                 return false;
             }
         }
@@ -460,17 +488,35 @@ namespace WDE.PedalMuter
         {
             if (!EnsurePollSetup()) return;
 
+            // Load-time clobber guard (DrumGrid §2).
+            //
+            // On 1827+ the int[] pvalues store is freshly allocated all-ZERO
+            // and only becomes NoValue after the engine's first post-tick
+            // Array.Fill. ReBuzz pushes each parameter's DefValue (Mute=0)
+            // through the setters at load and on track creation — before
+            // playback — so an unguarded sibling walk would read 0 for every
+            // track, pass the NoValue guard, and force-unmute saved-muted
+            // targets. The transport-playing check keeps the poll off the
+            // all-zero array: while running, untouched tracks read NoValue and
+            // are skipped. (Trade-off: a stopped-state multi-track write — e.g.
+            // "Unmute All" while paused — won't be recovered by the poll. That
+            // case rarely collides, since the audio thread isn't draining
+            // parametersChanged, so each SetValue tends to deliver its own
+            // setter.)
+            var buzz = Buzz;
+            bool playing = false;
+            try { playing = buzz != null && buzz.Playing; } catch { }
+            if (!playing) return;
+
             int noValue = 255;
             try { noValue = _ownMuteParam.NoValue; } catch { }
 
             int recovered = 0;
-            foreach (var kv in _ownMutePValues)
+            for (int track = 0; track < MAX_TRACKS; track++)
             {
-                int track  = kv.Key;
-                int pvalue = kv.Value;
-
                 if (track == firedTrack) continue;
-                if ((uint)track >= MAX_TRACKS) continue;
+
+                int pvalue = _ownMuteReader(track);
                 if (pvalue == noValue) continue;          // no event this row
                 if (pvalue != 0 && pvalue != 1) continue; // out of range
 
@@ -775,7 +821,7 @@ namespace WDE.PedalMuter
         void ShowAbout()
         {
             MessageBox.Show(
-                "Pedal Muter 1.0\n\n" +
+                "Pedal Muter 1.2\n\n" +
                 "Mutes any number of native or managed machines via pattern " +
                 "automation or peer control. Each track maps to one or more " +
                 "target machines; setting the track's Mute parameter to 1 " +
